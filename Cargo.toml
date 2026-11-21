@@ -1,0 +1,32 @@
+[package]
+name = "tinyglow"
+version = "0.1.0"
+edition = "2024"
+description = "Classic silhouette glow for Rust renderers"
+readme = "README.md"
+
+[features]
+d3d9 = ["dep:windows", "windows/Win32_Graphics_Direct3D9"]
+d3d10 = ["dep:windows", "windows/Win32_Graphics_Direct3D10", "windows/Win32_Graphics_Dxgi_Common"]
+d3d11 = ["dep:windows", "windows/Win32_Graphics_Direct3D11", "windows/Win32_Graphics_Dxgi_Common"]
+d3d12 = ["dep:windows", "windows/Win32_Graphics_Direct3D12", "windows/Win32_Graphics_Dxgi_Common"]
+opengl = ["dep:glow"]
+preview = [
+    "d3d9",
+    "windows/Win32_Graphics_Gdi",
+    "windows/Win32_System_LibraryLoader",
+    "windows/Win32_UI_WindowsAndMessaging",
+]
+
+[[example]]
+name = "preview"
+path = "examples/preview/main.rs"
+required-features = ["preview"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+glow = { version = "0.18", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", optional = true, features = [
+    "Win32_Graphics_Direct3D_Fxc",
+] }
