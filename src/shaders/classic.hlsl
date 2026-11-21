@@ -47,6 +47,14 @@ Vertex fullscreen_vertex(uint vertex : SV_VertexID)
     return result;
 }
 
+Vertex fullscreen_quad(uint vertex : SV_VertexID)
+{
+    Vertex result;
+    result.uv = float2(vertex & 1, (vertex >> 1) & 1);
+    result.position = float4(result.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return result;
+}
+
 #define BLUR_ENTRY blur_fragment
 #define COMPOSITE_ENTRY composite_fragment
 

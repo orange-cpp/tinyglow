@@ -1,0 +1,9 @@
+
+float4 style(float2 uv, float g)
+{
+    float h = flames(uv, g, 1.0, 0.07);
+    float near = max(glow_at(uv + float2(0.0, 0.07 * SIZE)), glow_at(uv + float2(0.0, 0.12 * SIZE)));
+    float spark = embers(uv, saturate(near * 2.0) * (1.0 - saturate(h)));
+    float3 o = c0.rgb * saturate(h * 2.2) * 1.2 + float3(1, 1, 1) * saturate(h * 2.2 - 1.2) * 0.7;
+    return float4(o + lerp(c0.rgb, float3(1, 1, 1), 0.4) * spark * 1.5, 0);
+}

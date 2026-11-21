@@ -5,7 +5,8 @@
 
 use crate::d3d_shader::compile;
 use crate::shaders::{self, Api};
-use crate::{Backend, ClassicPasses, Extent};
+use crate::{Backend, ClassicPasses, Extent, GlowStyle, StyledBackend, StyledPasses};
+use std::collections::HashMap;
 use std::ptr::null_mut;
 use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG};
 use windows::Win32::Graphics::Direct3D9::*;
@@ -13,7 +14,7 @@ use windows::core::{Error, HRESULT, Result};
 
 pub struct Target<'a> {
     pub color: &'a IDirect3DSurface9,
-    /// The glow is drawn where this stencil is nonzero.
+    /// For styles that use the stencil, glow is drawn where it is nonzero.
     pub stencil: Option<&'a IDirect3DSurface9>,
 }
 
@@ -23,6 +24,7 @@ pub struct D3d9 {
     vertex: IDirect3DVertexShader9,
     blur: IDirect3DPixelShader9,
     composite: IDirect3DPixelShader9,
+    styles: HashMap<GlowStyle, IDirect3DPixelShader9>,
     scratch: Option<Scratch>,
 }
 
@@ -35,6 +37,15 @@ struct Scratch {
 struct Texture {
     handle: IDirect3DTexture9,
     surface: IDirect3DSurface9,
+}
+
+struct Passes<'a> {
+    mask_extent: Extent,
+    output_extent: Extent,
+    blur: [[f32; 4]; 2],
+    composite: &'a [[f32; 4]],
+    shader: &'a IDirect3DPixelShader9,
+    style: Option<GlowStyle>,
 }
 
 impl D3d9 {
@@ -54,6 +65,7 @@ impl D3d9 {
                 vertex: device.CreateVertexShader(vertex.GetBufferPointer().cast())?,
                 blur: device.CreatePixelShader(blur.GetBufferPointer().cast())?,
                 composite: device.CreatePixelShader(composite.GetBufferPointer().cast())?,
+                styles: HashMap::new(),
                 scratch: None,
             })
         }
@@ -112,6 +124,7 @@ impl D3d9 {
                 device.SetRenderTarget(slot, None::<&IDirect3DSurface9>)?;
             }
             device.SetDepthStencilSurface(None::<&IDirect3DSurface9>)?;
+            device.SetTexture(1, None::<&IDirect3DBaseTexture9>)?;
             device.SetVertexShader(&self.vertex)?;
             device.SetFVF(D3DFVF_XYZ | D3DFVF_TEX1)?;
             device.SetStreamSourceFreq(0, 1)?;
@@ -134,6 +147,12 @@ impl D3d9 {
             ] {
                 device.SetRenderState(state, value)?;
             }
+        }
+        self.configure_sampler(0)
+    }
+
+    fn configure_sampler(&self, slot: u32) -> Result<()> {
+        unsafe {
             for (state, value) in [
                 (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP.0 as u32),
                 (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP.0 as u32),
@@ -143,16 +162,15 @@ impl D3d9 {
                 (D3DSAMP_MAXMIPLEVEL, 0),
                 (D3DSAMP_SRGBTEXTURE, 0),
             ] {
-                device.SetSamplerState(0, state, value)?;
+                self.device.SetSamplerState(slot, state, value)?;
             }
         }
         Ok(())
     }
 
-    fn configure_composite(&self, stencil: bool) -> Result<()> {
+    fn configure_composite(&self, stencil: bool, srgb: bool) -> Result<()> {
         let device = &self.device;
-        // The composite writes zero alpha, so ONE / INVSRCALPHA adds RGB
-        // while leaving the scene alpha intact.
+        // Classic emits zero alpha. Styles can also attenuate the scene.
         unsafe {
             for (state, value) in [
                 (D3DRS_ALPHABLENDENABLE, 1),
@@ -160,7 +178,7 @@ impl D3d9 {
                 (D3DRS_SRCBLEND, D3DBLEND_ONE.0 as u32),
                 (D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA.0 as u32),
                 (D3DRS_SEPARATEALPHABLENDENABLE, 0),
-                (D3DRS_SRGBWRITEENABLE, 1),
+                (D3DRS_SRGBWRITEENABLE, u32::from(srgb)),
                 (D3DRS_STENCILENABLE, u32::from(stencil)),
                 (D3DRS_STENCILFUNC, D3DCMP_NOTEQUAL.0 as u32),
                 (D3DRS_STENCILREF, 0),
@@ -172,7 +190,7 @@ impl D3d9 {
             ] {
                 device.SetRenderState(state, value)?;
             }
-            device.SetSamplerState(0, D3DSAMP_SRGBTEXTURE, 1)?;
+            device.SetSamplerState(0, D3DSAMP_SRGBTEXTURE, u32::from(srgb))?;
         }
         Ok(())
     }
@@ -182,7 +200,7 @@ impl D3d9 {
         source: &IDirect3DTexture9,
         target: &Target<'_>,
         extent: Extent,
-        parameters: [f32; 4],
+        parameters: &[[f32; 4]],
     ) -> Result<()> {
         let device = &self.device;
         let x = 1.0 / extent.width() as f32;
@@ -200,7 +218,11 @@ impl D3d9 {
             device.SetRenderTarget(0, target.color)?;
             device.SetDepthStencilSurface(target.stencil)?;
             device.SetTexture(0, source)?;
-            device.SetPixelShaderConstantF(0, parameters.as_ptr(), 1)?;
+            device.SetPixelShaderConstantF(
+                0,
+                parameters.as_ptr().cast(),
+                parameters.len() as u32,
+            )?;
             device.DrawPrimitiveUP(
                 D3DPT_TRIANGLESTRIP,
                 2,
@@ -214,7 +236,7 @@ impl D3d9 {
         &self,
         mask: &IDirect3DTexture9,
         target: &Target<'_>,
-        passes: ClassicPasses,
+        passes: Passes<'_>,
         scratch: &Scratch,
     ) -> Result<()> {
         self.configure()?;
@@ -227,7 +249,7 @@ impl D3d9 {
                 stencil: None,
             },
             passes.mask_extent,
-            passes.horizontal,
+            &passes.blur[..1],
         )?;
         self.pass(
             &scratch.horizontal.handle,
@@ -236,16 +258,60 @@ impl D3d9 {
                 stencil: None,
             },
             passes.mask_extent,
-            passes.vertical,
+            &passes.blur[1..],
         )?;
-        self.configure_composite(target.stencil.is_some())?;
-        unsafe { self.device.SetPixelShader(&self.composite)? };
+        let stencil = target
+            .stencil
+            .filter(|_| !passes.style.is_some_and(GlowStyle::draws_inside));
+        self.configure_composite(stencil.is_some(), passes.style.is_none())?;
+        if passes.style.is_some() {
+            self.configure_sampler(1)?;
+            unsafe { self.device.SetTexture(1, mask)? };
+        }
+        unsafe { self.device.SetPixelShader(passes.shader)? };
         self.pass(
             &scratch.vertical.handle,
-            target,
+            &Target {
+                color: target.color,
+                stencil,
+            },
             passes.output_extent,
             passes.composite,
         )
+    }
+
+    fn draw(
+        &self,
+        mask: &IDirect3DTexture9,
+        target: &Target<'_>,
+        passes: Passes<'_>,
+    ) -> Result<()> {
+        let mut mask_desc = D3DSURFACE_DESC::default();
+        let mut target_desc = D3DSURFACE_DESC::default();
+        // Read the headers before any drawing or pipeline state changes.
+        unsafe {
+            mask.GetLevelDesc(0, &mut mask_desc)?;
+            target.color.GetDesc(&mut target_desc)?;
+        }
+        if Extent::new(mask_desc.Width, mask_desc.Height) != Some(passes.mask_extent)
+            || Extent::new(target_desc.Width, target_desc.Height) != Some(passes.output_extent)
+        {
+            return Err(Error::new(
+                E_INVALIDARG,
+                "Glow texture sizes do not match the pass extents",
+            ));
+        }
+        if passes.style.is_some() && unsafe { mask.GetSurfaceLevel(0)? == *target.color } {
+            return Err(Error::new(
+                E_INVALIDARG,
+                "The styled glow mask and scene must be distinct",
+            ));
+        }
+
+        let state = SavedState::capture(&self.device, self.target_slots)?;
+        let draw = self.submit(mask, target, passes, self.scratch.as_ref().unwrap());
+        let restore = state.restore(&self.device);
+        draw.and(restore)
     }
 }
 
@@ -260,27 +326,49 @@ impl Backend for D3d9 {
         target: &Self::Target<'_>,
         passes: ClassicPasses,
     ) -> Result<()> {
-        let mut mask_desc = D3DSURFACE_DESC::default();
-        let mut target_desc = D3DSURFACE_DESC::default();
-        // Read the headers before any drawing or pipeline state changes.
-        unsafe {
-            mask.GetLevelDesc(0, &mut mask_desc)?;
-            target.color.GetDesc(&mut target_desc)?;
-        }
-        if Extent::new(mask_desc.Width, mask_desc.Height) != Some(passes.mask_extent)
-            || Extent::new(target_desc.Width, target_desc.Height) != Some(passes.output_extent)
-        {
-            return Err(Error::new(
-                E_INVALIDARG,
-                "Classic glow texture sizes do not match the pass extents",
-            ));
-        }
-
         self.prepare(passes.mask_extent)?;
-        let state = SavedState::capture(&self.device, self.target_slots)?;
-        let draw = self.submit(mask, target, passes, self.scratch.as_ref().unwrap());
-        let restore = state.restore(&self.device);
-        draw.and(restore)
+        self.draw(
+            mask,
+            target,
+            Passes {
+                mask_extent: passes.mask_extent,
+                output_extent: passes.output_extent,
+                blur: [passes.horizontal, passes.vertical],
+                composite: &[passes.composite],
+                shader: &self.composite,
+                style: None,
+            },
+        )
+    }
+}
+
+impl StyledBackend for D3d9 {
+    fn draw_styled(
+        &mut self,
+        mask: &Self::Mask,
+        target: &Self::Target<'_>,
+        passes: StyledPasses,
+    ) -> Result<()> {
+        self.prepare(passes.mask_extent)?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.styles.entry(passes.style) {
+            let bytecode = compile(shaders::d3d9_style(passes.style))?;
+            entry.insert(unsafe {
+                self.device
+                    .CreatePixelShader(bytecode.GetBufferPointer().cast())?
+            });
+        }
+        self.draw(
+            mask,
+            target,
+            Passes {
+                mask_extent: passes.mask_extent,
+                output_extent: passes.output_extent,
+                blur: [passes.horizontal, passes.vertical],
+                composite: &passes.composite,
+                shader: &self.styles[&passes.style],
+                style: Some(passes.style),
+            },
+        )
     }
 }
 
@@ -311,6 +399,7 @@ impl SavedState {
         // Try every restoration even if an individual call fails.
         unsafe {
             let mut result = device.SetTexture(0, None::<&IDirect3DBaseTexture9>);
+            result = result.and(device.SetTexture(1, None::<&IDirect3DBaseTexture9>));
             result = result.and(device.SetDepthStencilSurface(None::<&IDirect3DSurface9>));
             result = result.and(device.SetRenderTarget(0, &self.primary));
             for (slot, target) in (1..).zip(&self.additional) {
@@ -327,5 +416,14 @@ fn optional_surface(result: Result<IDirect3DSurface9>) -> Result<Option<IDirect3
     match result {
         Err(error) if error.code() == D3DERR_NOTFOUND => Ok(None),
         other => other.map(Some),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn all_style_shaders_compile_for_shader_model_3() {
+    for &style in GlowStyle::ALL {
+        compile(shaders::d3d9_style(style))
+            .unwrap_or_else(|error| panic!("{}: {error}", style.name()));
     }
 }

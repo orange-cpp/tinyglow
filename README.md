@@ -1,8 +1,8 @@
 # tinyglow
 
-Rust library for a Classic outline glow effect. The renderer supplies a
-screen-space silhouette and a scene destination. Tinyglow calculates
-the passes and provides shaders for OpenGL 4.3 and Direct3D 9, 10, 11, and 12.
+Rust library for silhouette glow effects. The renderer supplies a screen-space
+silhouette and a scene destination. Classic and all 37 stylized glow shaders
+run on OpenGL 4.3 and Direct3D 9, 10, 11, and 12.
 
 ## Preview app
 
@@ -12,10 +12,10 @@ On Windows, run the Direct3D 9 preview from the repository root.
 cargo run --release --features preview --example preview
 ```
 
-The left panel shows the original rotating model and the right panel runs
-Tinyglow's Classic pass. Use the toolbar to toggle the effect, change its color,
-thickness or intensity, switch between full and half resolution, or pause at a
-specific angle.
+The left panel shows the original rotating model. Use the **Style** dropdown
+to preview Classic or any of the 37 additional shaders on the right. The toolbar
+controls color, thickness, intensity, and resolution. Pause freezes the model
+and the shader animation.
 
 ## Direct3D 9
 
@@ -38,12 +38,8 @@ let mask = backend.create_mask(glow.mask_extent(extent))?;
 // Each frame, clear the mask to black and render the selected silhouettes in white.
 // Prepare the scene stencil with zero on excluded pixels and nonzero elsewhere.
 // Inside BeginScene / EndScene, after scene and mask rendering:
-glow.render(
-    &mut backend,
-    &mask,
-    &Target { color: &scene_surface, stencil: Some(&scene_depth_stencil) },
-    extent,
-)?;
+let target = Target { color: &scene_surface, stencil: Some(&scene_depth_stencil) };
+glow.render(&mut backend, &mask, &target, extent)?;
 ```
 
 Reuse the executor and mask across frames. Recreate the mask when its extent
@@ -52,10 +48,36 @@ changes. Before a Direct3D 9 device reset, release the mask and call
 A target with `stencil: None` reproduces the reference's no-stencil fallback,
 which allows the glow to cover the silhouette interior.
 
+## Styled glow
+
+Use `GlowStyle::ALL` and `GlowStyle::name()` to populate a style selector.
+Use `StyledGlow::render` with any native executor. Supply a mask and scene that
+do not share the sampled subresource, and pass elapsed animation time with each
+draw.
+
+```rust,ignore
+use tinyglow::{GlowStyle, StyledGlow};
+
+let started = std::time::Instant::now();
+let mut neon = StyledGlow::new(GlowStyle::Neon);
+neon.glow = glow;
+// Repeat the draw each frame with the same starting instant.
+neon.render(&mut backend, &mask, &target, extent, started.elapsed())?;
+```
+
+`StyledGlow` adds animation speed and feature size controls. Rim Light, Comic,
+Energy Shield, X-Ray, and Burn also draw inside the silhouette and bypass the
+stencil by design. The executors cache style shaders or pipeline states on first
+use. The styles use the display-encoded scene bytes for blending, as on Direct3D
+9. On Direct3D 10–12 supply an 8-bit UNORM RTV. On OpenGL the executor disables
+`GL_FRAMEBUFFER_SRGB` for styled draws, so either an RGBA8 or an sRGB 8-bit color
+attachment works. Classic continues to use sRGB reads and writes for its
+composite.
+
 ## OpenGL
 
 Enable the `opengl` feature for the native desktop OpenGL 4.3 executor. Supply a
-single-sample, linear RGBA8 mask at `glow.mask_extent(extent)` and an sRGB
+single-sample, linear RGBA8 mask at `glow.mask_extent(extent)` and a
 draw framebuffer with one color output. Keep the same context current whenever
 you create, use, or drop the executor.
 
@@ -74,8 +96,9 @@ Use `framebuffer: None` with an sRGB-capable default framebuffer.
 ## Direct3D 10 and 11
 
 Enable the `d3d10` or `d3d11` feature on Windows. The native executor needs a
-linear, single-sample `Texture2D` silhouette SRV, an sRGB scene RTV, and an
-optional stencil DSV matching the scene target. Render the silhouette at
+linear, single-sample `Texture2D` silhouette SRV, a scene RTV in the format
+required by the effect, and an optional stencil DSV matching the scene target.
+Render the silhouette at
 `glow.mask_extent(extent)` and pass the scene dimensions as `extent`.
 
 ```rust,ignore
@@ -93,8 +116,9 @@ your pipeline for the next pass.
 ## Direct3D 12
 
 Enable `d3d12` on Windows. Create an executor for the scene's single-sample
-sRGB RTV format and optional stencil DSV format. Wrap the linear RGBA8
-silhouette texture with `create_mask` to allocate its shader descriptors and
+sRGB RTV format and optional stencil DSV format. To draw a styled effect, pass
+the corresponding UNORM RTV to `Target::new` on the same executor. Wrap the
+linear RGBA8 silhouette texture with `create_mask` to allocate its shader descriptors and
 scratch textures. Reuse the mask as long as the underlying texture is reused
 and its extent matches `glow.mask_extent(extent)`.
 
@@ -150,3 +174,18 @@ Classic preserves the reference's 13 weighted taps, its width-based vertical
 step, 8-bit intermediate targets, and color conversion with exponent 2.2.
 Thickness controls the vertical pass gain. Half quality uses floor-divided
 dimensions with a minimum of one pixel per axis.
+
+For styled effects, implement `StyledBackend` and load `shaders::styled(Api::…, style)`.
+Draw a four-vertex triangle strip and use the same two blurs. For the composite,
+bind the linear UNORM view of the vertical blur at slot 0 and the original
+linear mask at slot 1. Upload the four `float4`
+vectors in `StyledPasses::composite` to `b0` on Direct3D 10–12, `c0`–`c3`
+on Direct3D 9, or the `parameters` array on OpenGL. Use the same clamped linear
+sampler in `s0` on Direct3D 10–12, or for both texture slots on OpenGL and Direct3D 9.
+
+On OpenGL, draw the styled composite into an output-size RGBA32F attachment
+with blending and stencil disabled. Then use `shaders::opengl_style_resolve()`
+to flip the result as it blends into the scene. This gives the procedural patterns
+the same raster direction as Direct3D 9. Apply the Classic blend factors on the
+scene draw, and use `NOT_EQUAL` only when the scene has a stencil and the style's
+`draws_inside()` returns `false`.

@@ -1,8 +1,9 @@
 #![cfg(all(windows, feature = "d3d9"))]
 
 use std::ptr::{null, null_mut};
+use std::time::Duration;
 use tinyglow::d3d9::{D3d9, Target};
-use tinyglow::{ClassicGlow, Extent};
+use tinyglow::{ClassicGlow, Extent, GlowStyle, StyledGlow};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct3D9::*;
 use windows::core::Result;
@@ -14,7 +15,7 @@ unsafe extern "system" {
 
 #[test]
 #[ignore = "requires a desktop session and a Direct3D 9 device"]
-fn classic_draws_halo_and_preserves_stencil_interior() -> Result<()> {
+fn glow_shaders_draw_with_the_expected_stencil_behavior() -> Result<()> {
     let (width, height) = (80, 64);
     let extent = Extent::new(width, height).unwrap();
     // All COM resources stay alive through their device calls. The readback
@@ -117,25 +118,61 @@ fn classic_draws_halo_and_preserves_stencil_interior() -> Result<()> {
             null_mut(),
         )?;
         let readback = readback.unwrap();
-        device.GetRenderTargetData(&scene, &readback)?;
-        let mut locked = D3DLOCKED_RECT::default();
-        readback.LockRect(&mut locked, null(), D3DLOCK_READONLY as u32)?;
-        let pixel = |x: isize, y: isize| {
-            locked
-                .pBits
-                .cast::<u8>()
-                .offset(y * locked.Pitch as isize + x * 4)
-                .cast::<u32>()
-                .read_unaligned()
+        let sample = || -> Result<[u32; 4]> {
+            device.GetRenderTargetData(&scene, &readback)?;
+            let mut locked = D3DLOCKED_RECT::default();
+            readback.LockRect(&mut locked, null(), D3DLOCK_READONLY as u32)?;
+            let pixel = |x: isize, y: isize| {
+                locked
+                    .pBits
+                    .cast::<u8>()
+                    .offset(y * locked.Pitch as isize + x * 4)
+                    .cast::<u32>()
+                    .read_unaligned()
+            };
+            let pixels = [pixel(0, 0), pixel(40, 32), pixel(28, 32), pixel(40, 20)];
+            readback.UnlockRect()?;
+            Ok(pixels)
         };
-        let pixels = [pixel(0, 0), pixel(40, 32), pixel(28, 32), pixel(40, 20)];
-        readback.UnlockRect()?;
 
+        let pixels = sample()?;
         assert_eq!(pixels[0], background, "far from silhouette");
         assert_eq!(pixels[1], background, "inside stencil cutout");
         for halo in &pixels[2..] {
             assert_eq!(halo & 0xff00_ffff, background & 0xff00_ffff);
             assert!(halo & 0x00ff_0000 > background & 0x00ff_0000);
+        }
+
+        let target = Target {
+            color: &scene,
+            stencil: Some(&stencil),
+        };
+        for &style in GlowStyle::ALL {
+            device.Clear(0, null(), D3DCLEAR_TARGET as u32, background, 1.0, 0)?;
+            let mut styled = StyledGlow::new(style);
+            styled.glow = glow;
+            device.BeginScene()?;
+            let draw = styled.render(
+                &mut backend,
+                &mask,
+                &target,
+                extent,
+                Duration::from_millis(1250),
+            );
+            draw.and(device.EndScene())
+                .unwrap_or_else(|error| panic!("{}: {error}", style.name()));
+            assert_eq!(device.GetRenderTarget(0)?, scene);
+            assert_eq!(device.GetDepthStencilSurface()?, stencil);
+            let [_, interior, left_halo, _] = sample()?;
+            if !style.draws_inside() {
+                assert_eq!(interior, background, "{}", style.name());
+            }
+            if style == GlowStyle::Neon {
+                assert_ne!(left_halo, background);
+            }
+            if style == GlowStyle::XRay {
+                assert_ne!(interior, background);
+            }
         }
     }
     Ok(())

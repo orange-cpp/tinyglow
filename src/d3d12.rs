@@ -5,10 +5,14 @@
 
 use crate::d3d_shader::{blob_bytes, compile, diagnostic, is_srgb, out};
 use crate::shaders::{self, Api, Shader};
-use crate::{Backend, ClassicPasses, Extent};
+use crate::styles::DrawPasses;
+use crate::{Backend, ClassicPasses, Extent, GlowStyle, StyledBackend, StyledPasses};
+use std::collections::{HashMap, hash_map::Entry};
 use std::mem::ManuallyDrop;
 use windows::Win32::Foundation::{E_INVALIDARG, RECT};
-use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, ID3DBlob,
+};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::{Error, Result};
@@ -26,8 +30,10 @@ impl<'a> Target<'a> {
     ///
     /// Use a recording direct graphics list on the executor's device, outside
     /// any render pass. The CPU descriptors must describe a single-sample
-    /// scene RTV and optional matching DSV in the formats configured on the
-    /// executor. Their dimensions must match the extent passed to `render`.
+    /// scene RTV and optional matching DSV. Use the executor's configured
+    /// sRGB color format for Classic or its UNORM counterpart for styled
+    /// glow. Use the configured stencil format for the DSV. The scene views
+    /// must match the extent passed to `render`.
     /// Put the scene color in RENDER_TARGET state, the silhouette in
     /// PIXEL_SHADER_RESOURCE, and the depth/stencil in the state required by
     /// its DSV. Keep GPU resources, the executor and the mask alive until the
@@ -53,7 +59,7 @@ pub struct Mask {
     _source: ID3D12Resource,
     shader_heap: ID3D12DescriptorHeap,
     _rtv_heap: ID3D12DescriptorHeap,
-    srvs: [D3D12_GPU_DESCRIPTOR_HANDLE; 3],
+    srvs: [D3D12_GPU_DESCRIPTOR_HANDLE; 4],
     rtvs: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
     scratch: [ID3D12Resource; 2],
 }
@@ -62,12 +68,18 @@ pub struct D3d12 {
     device: ID3D12Device,
     root: ID3D12RootSignature,
     blur: ID3D12PipelineState,
+    styled_blur: ID3D12PipelineState,
     composite: ID3D12PipelineState,
     stencil_composite: Option<ID3D12PipelineState>,
+    quad: ID3DBlob,
+    styled_color: DXGI_FORMAT,
+    stencil_format: Option<DXGI_FORMAT>,
+    styles: HashMap<(GlowStyle, bool), ID3D12PipelineState>,
 }
 
 impl D3d12 {
-    /// Creates pipeline states for a single-sample sRGB scene color format.
+    /// Creates an executor for a single-sample color format family. Supply
+    /// the sRGB format. Styled draws use the corresponding UNORM view.
     /// Supply the scene stencil view format to enable stencil-masked draws.
     pub fn new(
         device: &ID3D12Device,
@@ -98,6 +110,10 @@ impl D3d12 {
             profile: "vs_5_0",
             ..shaders.fullscreen_vertex
         })?;
+        let quad = compile(Shader {
+            profile: "vs_5_0",
+            ..shaders::styled_vertex(Api::Direct3D12)
+        })?;
         let blur = compile(Shader {
             profile: "ps_5_0",
             ..shaders.blur_fragment
@@ -111,6 +127,15 @@ impl D3d12 {
             device,
             &root,
             &vertex,
+            &blur,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            false,
+            None,
+        )?;
+        let styled_blur = pipeline(
+            device,
+            &root,
+            &quad,
             &blur,
             DXGI_FORMAT_R8G8B8A8_UNORM,
             false,
@@ -135,8 +160,18 @@ impl D3d12 {
             device: device.clone(),
             root,
             blur: blur_pipeline,
+            styled_blur,
             composite: composite_pipeline,
             stencil_composite,
+            quad,
+            styled_color: match color_format {
+                DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => DXGI_FORMAT_R8G8B8A8_UNORM,
+                DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => DXGI_FORMAT_B8G8R8A8_UNORM,
+                DXGI_FORMAT_B8G8R8X8_UNORM_SRGB => DXGI_FORMAT_B8G8R8X8_UNORM,
+                _ => unreachable!("sRGB format validated above"),
+            },
+            stencil_format,
+            styles: HashMap::new(),
         })
     }
 
@@ -182,7 +217,7 @@ impl D3d12 {
                 self.device
                     .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                         Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                        NumDescriptors: 3,
+                        NumDescriptors: 4,
                         Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                         NodeMask: 0,
                     })?;
@@ -208,7 +243,10 @@ impl D3d12 {
             let rtvs = std::array::from_fn(|index| D3D12_CPU_DESCRIPTOR_HANDLE {
                 ptr: rtv_cpu + index * rtv_stride as usize,
             });
-            for (index, resource) in [source, &scratch[0], &scratch[1]].into_iter().enumerate() {
+            for (index, resource) in [source, &scratch[0], &scratch[1], &scratch[1]]
+                .into_iter()
+                .enumerate()
+            {
                 let sample = D3D12_SHADER_RESOURCE_VIEW_DESC {
                     Format: if index == 2 {
                         DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
@@ -255,56 +293,100 @@ impl D3d12 {
             })
         }
     }
-}
 
-impl Backend for D3d12 {
-    type Mask = Mask;
-    type Target<'a> = Target<'a>;
-    type Error = Error;
-
-    fn draw_classic(
-        &mut self,
-        mask: &Mask,
-        target: &Target<'_>,
-        passes: ClassicPasses,
-    ) -> Result<()> {
+    fn draw(&mut self, mask: &Mask, target: &Target<'_>, passes: DrawPasses) -> Result<()> {
         if mask.extent != passes.mask_extent || mask.device != self.device {
             return Err(Error::new(
                 E_INVALIDARG,
-                "Classic glow mask does not match the extent or device",
+                "Glow mask does not match the extent or device",
             ));
         }
         // Scissors use signed coordinates. Check the conversion before recording anything.
         let mask_rect = scissor(passes.mask_extent)?;
         let output_rect = scissor(passes.output_extent)?;
-        let composite = match target.stencil {
-            Some(_) => self.stencil_composite.as_ref().ok_or_else(|| {
-                Error::new(
-                    E_INVALIDARG,
-                    "The executor was created without a stencil format",
-                )
-            })?,
+        let stencil = target.stencil.filter(|_| passes.uses_stencil());
+        let stencil_format = stencil
+            .map(|_| {
+                self.stencil_format.ok_or_else(|| {
+                    Error::new(
+                        E_INVALIDARG,
+                        "The executor was created without a stencil format",
+                    )
+                })
+            })
+            .transpose()?;
+        let composite = match passes.style {
+            Some(style) => {
+                let key = (style, stencil.is_some());
+                if let Entry::Vacant(entry) = self.styles.entry(key) {
+                    let fragment = compile(Shader {
+                        profile: "ps_5_0",
+                        ..shaders::styled(Api::Direct3D12, style).composite_fragment
+                    })?;
+                    entry.insert(pipeline(
+                        &self.device,
+                        &self.root,
+                        &self.quad,
+                        &fragment,
+                        self.styled_color,
+                        true,
+                        stencil_format,
+                    )?);
+                }
+                &self.styles[&key]
+            }
+            None if stencil.is_some() => self.stencil_composite.as_ref().unwrap(),
             None => &self.composite,
         };
         let list = target.list;
+        let (blur, topology, vertices, blurred) = if passes.style.is_some() {
+            (
+                &self.styled_blur,
+                D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+                4,
+                mask.srvs[3],
+            )
+        } else {
+            (
+                &self.blur,
+                D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                3,
+                mask.srvs[2],
+            )
+        };
         // The target contract keeps the descriptors and recorded objects live.
         unsafe {
             list.SetDescriptorHeaps(&[Some(mask.shader_heap.clone())]);
             list.SetGraphicsRootSignature(&self.root);
-            list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.SetGraphicsRootDescriptorTable(2, mask.srvs[0]);
+            list.IASetPrimitiveTopology(topology);
             list.SetPredication(None::<&ID3D12Resource>, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
             list.OMSetStencilRef(0);
-            list.SetPipelineState(&self.blur);
+            list.SetPipelineState(blur);
 
             set_viewport(list, mask_rect);
-            draw(list, mask.srvs[0], mask.rtvs[0], None, passes.horizontal);
+            draw(
+                list,
+                mask.srvs[0],
+                mask.rtvs[0],
+                None,
+                &[passes.horizontal],
+                vertices,
+            );
             transition(
                 list,
                 &mask.scratch[0],
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             );
-            draw(list, mask.srvs[1], mask.rtvs[1], None, passes.vertical);
+            draw(
+                list,
+                mask.srvs[1],
+                mask.rtvs[1],
+                None,
+                &[passes.vertical],
+                vertices,
+            );
             transition(
                 list,
                 &mask.scratch[1],
@@ -316,10 +398,11 @@ impl Backend for D3d12 {
             set_viewport(list, output_rect);
             draw(
                 list,
-                mask.srvs[2],
+                blurred,
                 target.color,
-                target.stencil,
-                passes.composite,
+                stencil,
+                passes.composite(),
+                vertices,
             );
             for scratch in &mask.scratch {
                 transition(
@@ -334,11 +417,48 @@ impl Backend for D3d12 {
     }
 }
 
+impl Backend for D3d12 {
+    type Mask = Mask;
+    type Target<'a> = Target<'a>;
+    type Error = Error;
+
+    fn draw_classic(
+        &mut self,
+        mask: &Mask,
+        target: &Target<'_>,
+        passes: ClassicPasses,
+    ) -> Result<()> {
+        self.draw(mask, target, DrawPasses::classic(passes))
+    }
+}
+
+impl StyledBackend for D3d12 {
+    fn draw_styled(
+        &mut self,
+        mask: &Mask,
+        target: &Target<'_>,
+        passes: StyledPasses,
+    ) -> Result<()> {
+        self.draw(mask, target, DrawPasses::styled(passes))
+    }
+}
+
 fn root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignature> {
-    let range = D3D12_DESCRIPTOR_RANGE {
+    let ranges = [0, 1].map(|register| D3D12_DESCRIPTOR_RANGE {
         RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
         NumDescriptors: 1,
+        BaseShaderRegister: register,
         ..Default::default()
+    });
+    let texture = |range| D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                NumDescriptorRanges: 1,
+                pDescriptorRanges: range,
+            },
+        },
     };
     let params = [
         D3D12_ROOT_PARAMETER {
@@ -346,21 +466,13 @@ fn root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignature> {
             ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
             Anonymous: D3D12_ROOT_PARAMETER_0 {
                 Constants: D3D12_ROOT_CONSTANTS {
-                    Num32BitValues: 4,
+                    Num32BitValues: 16,
                     ..Default::default()
                 },
             },
         },
-        D3D12_ROOT_PARAMETER {
-            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
-            Anonymous: D3D12_ROOT_PARAMETER_0 {
-                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
-                    NumDescriptorRanges: 1,
-                    pDescriptorRanges: &range,
-                },
-            },
-        },
+        texture(&ranges[0]),
+        texture(&ranges[1]),
     ];
     let sampler = D3D12_STATIC_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
@@ -537,7 +649,8 @@ unsafe fn draw(
     sample: D3D12_GPU_DESCRIPTOR_HANDLE,
     color: D3D12_CPU_DESCRIPTOR_HANDLE,
     stencil: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
-    constants: [f32; 4],
+    constants: &[[f32; 4]],
+    vertices: u32,
 ) {
     unsafe {
         list.OMSetRenderTargets(
@@ -547,8 +660,13 @@ unsafe fn draw(
             stencil.as_ref().map(std::ptr::from_ref),
         );
         list.SetGraphicsRootDescriptorTable(1, sample);
-        list.SetGraphicsRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
-        list.DrawInstanced(3, 1, 0, 0);
+        list.SetGraphicsRoot32BitConstants(
+            0,
+            constants.len() as u32 * 4,
+            constants.as_ptr().cast(),
+            0,
+        );
+        list.DrawInstanced(vertices, 1, 0, 0);
     }
 }
 

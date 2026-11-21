@@ -2,7 +2,7 @@
 name = "tinyglow"
 version = "0.1.0"
 edition = "2024"
-description = "Classic silhouette glow for Rust renderers"
+description = "Silhouette glow effects for Rust renderers"
 readme = "README.md"
 
 [features]

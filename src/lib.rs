@@ -23,6 +23,9 @@ mod d3d_shader;
 #[cfg(all(not(target_arch = "wasm32"), feature = "opengl"))]
 pub mod opengl;
 pub mod shaders;
+mod styles;
+
+pub use styles::{GlowStyle, StyledBackend, StyledGlow, StyledPasses};
 
 /// The nonzero size of a two-dimensional render target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

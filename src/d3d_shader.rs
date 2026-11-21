@@ -61,3 +61,12 @@ pub(crate) fn is_srgb(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMA
             | DXGI_FORMAT_B8G8R8X8_UNORM_SRGB
     )
 }
+
+#[cfg(any(feature = "d3d10", feature = "d3d11"))]
+pub(crate) fn is_unorm(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> bool {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    matches!(
+        format,
+        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8X8_UNORM
+    )
+}

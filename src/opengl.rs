@@ -4,13 +4,16 @@
 //! for the glow composite. Rebind your pipeline before the next renderer pass.
 
 use crate::shaders::{self, Api};
-use crate::{Backend, ClassicPasses, Extent};
+use crate::styles::DrawPasses;
+use crate::{Backend, ClassicPasses, Extent, GlowStyle, StyledBackend, StyledPasses};
 use glow::HasContext as _;
+use std::collections::{HashMap, hash_map::Entry};
 use std::marker::PhantomData;
 use std::rc::Rc;
 
 pub struct Target {
-    /// Draw framebuffer with one sRGB color output. Use `None` for the default framebuffer.
+    /// Draw framebuffer with one 8-bit color output. Classic requires an
+    /// sRGB attachment. Use `None` for the default framebuffer.
     pub framebuffer: Option<glow::Framebuffer>,
     /// Enable the reference's nonzero stencil test on the draw framebuffer.
     pub stencil: bool,
@@ -21,8 +24,12 @@ pub struct OpenGl<'a> {
     vertex_array: glow::VertexArray,
     sampler: glow::Sampler,
     blur: Program<'a>,
+    styled_blur: Program<'a>,
     composite: Program<'a>,
+    resolve: Program<'a>,
+    styles: HashMap<GlowStyle, Program<'a>>,
     scratch: Option<Scratch<'a>>,
+    styled_output: Option<(Extent, RenderTexture<'a>)>,
     thread_bound: PhantomData<Rc<()>>,
 }
 
@@ -35,7 +42,8 @@ struct Program<'a> {
 struct Scratch<'a> {
     extent: Extent,
     horizontal: RenderTexture<'a>,
-    vertical: RenderTexture<'a>,
+    vertical_linear: Option<RenderTexture<'a>>,
+    vertical_srgb: Option<RenderTexture<'a>>,
 }
 
 struct RenderTexture<'a> {
@@ -59,7 +67,14 @@ impl<'a> OpenGl<'a> {
         let shaders = shaders::classic(Api::OpenGl);
         let vertex = shaders.fullscreen_vertex.source;
         let blur = Program::new(gl, vertex, shaders.blur_fragment.source)?;
+        let styled_blur = Program::new(
+            gl,
+            crate::shaders::styled_vertex(Api::OpenGl).source,
+            shaders.blur_fragment.source,
+        )?;
         let composite = Program::new(gl, vertex, shaders.composite_fragment.source)?;
+        let (resolve_vertex, resolve_fragment) = crate::shaders::opengl_style_resolve();
+        let resolve = Program::new(gl, resolve_vertex.source, resolve_fragment.source)?;
         // The construction contract supplies a current OpenGL 4.3 context.
         unsafe {
             let vertex_array = gl.create_vertex_array()?;
@@ -79,28 +94,49 @@ impl<'a> OpenGl<'a> {
                 vertex_array,
                 sampler,
                 blur,
+                styled_blur,
                 composite,
+                resolve,
+                styles: HashMap::new(),
                 scratch: None,
+                styled_output: None,
                 thread_bound: PhantomData,
             })
         }
     }
-}
 
-impl Backend for OpenGl<'_> {
-    type Mask = glow::Texture;
-    type Target<'a> = Target;
-    type Error = String;
-
-    fn draw_classic(
+    fn draw(
         &mut self,
-        mask: &Self::Mask,
-        target: &Self::Target<'_>,
-        passes: ClassicPasses,
+        mask: glow::Texture,
+        target: &Target,
+        passes: DrawPasses,
     ) -> Result<(), String> {
         let gl = self.gl;
         let mask_size = viewport_size(passes.mask_extent)?;
         let output_size = viewport_size(passes.output_extent)?;
+        let classic = passes.style.is_none();
+        let (blur, primitive, vertices) = if classic {
+            (&self.blur, glow::TRIANGLES, 3)
+        } else {
+            (&self.styled_blur, glow::TRIANGLE_STRIP, 4)
+        };
+        let composite = match passes.style {
+            Some(style) => {
+                if let Entry::Vacant(entry) = self.styles.entry(style) {
+                    let sources = shaders::styled(Api::OpenGl, style);
+                    entry.insert(
+                        Program::new(
+                            gl,
+                            sources.fullscreen_vertex.source,
+                            sources.composite_fragment.source,
+                        )
+                        .map_err(|error| format!("{}: {error}", style.name()))?,
+                    );
+                }
+                &self.styles[&style]
+            }
+            None => &self.composite,
+        };
         // The construction contract keeps the context current and the caller's
         // framebuffer and mask valid. The scratch FBOs each have one attachment.
         unsafe {
@@ -113,12 +149,22 @@ impl Backend for OpenGl<'_> {
                 self.scratch = Some(Scratch {
                     extent: passes.mask_extent,
                     horizontal: RenderTexture::new(gl, mask_size, glow::RGBA8)?,
-                    // With FRAMEBUFFER_SRGB disabled, blur writes directly to
-                    // the stored bytes. The composite samples with sRGB decoding.
-                    vertical: RenderTexture::new(gl, mask_size, glow::SRGB8_ALPHA8)?,
+                    vertical_linear: None,
+                    vertical_srgb: None,
                 });
             }
-            let scratch = self.scratch.as_ref().unwrap();
+            let scratch = self.scratch.as_mut().unwrap();
+            // Both blurs write raw bytes. Classic decodes the vertical result
+            // as sRGB while the styled shaders sample the bytes directly.
+            let (vertical, format) = if classic {
+                (&mut scratch.vertical_srgb, glow::SRGB8_ALPHA8)
+            } else {
+                (&mut scratch.vertical_linear, glow::RGBA8)
+            };
+            if vertical.is_none() {
+                *vertical = Some(RenderTexture::new(gl, mask_size, format)?);
+            }
+            let vertical = vertical.as_ref().unwrap();
             gl.bind_vertex_array(Some(self.vertex_array));
             gl.bind_sampler(0, Some(self.sampler));
             gl.polygon_mode(glow::FRONT_AND_BACK, glow::FILL);
@@ -142,36 +188,96 @@ impl Backend for OpenGl<'_> {
             gl.color_mask(true, true, true, true);
             gl.depth_mask(false);
             gl.viewport(0, 0, mask_size.0, mask_size.1);
-            self.blur.draw(
-                *mask,
+            blur.draw(
+                mask,
                 Some(scratch.horizontal.framebuffer),
-                &passes.horizontal,
+                &[passes.horizontal],
+                primitive,
+                vertices,
             );
-            self.blur.draw(
+            blur.draw(
                 scratch.horizontal.texture,
-                Some(scratch.vertical.framebuffer),
-                &passes.vertical,
+                Some(vertical.framebuffer),
+                &[passes.vertical],
+                primitive,
+                vertices,
             );
 
             gl.viewport(0, 0, output_size.0, output_size.1);
-            gl.enable(glow::FRAMEBUFFER_SRGB);
+            let height = [output_size.1 as f32, 0.0, 0.0, 0.0];
+            let (program, source, constants) = if classic {
+                gl.enable(glow::FRAMEBUFFER_SRGB);
+                (composite, vertical.texture, passes.composite())
+            } else {
+                // Match the DX9 rasterizer's Y direction while calculating
+                // the effect. Flipping after shading preserves noise cells
+                // that fall on coordinate boundaries and keeps scene blend
+                // and stencil tests in their native framebuffer orientation.
+                if self
+                    .styled_output
+                    .as_ref()
+                    .is_none_or(|(extent, _)| *extent != passes.output_extent)
+                {
+                    let texture = RenderTexture::new(gl, output_size, glow::RGBA32F)?;
+                    self.styled_output = Some((passes.output_extent, texture));
+                }
+                let (_, output) = self.styled_output.as_ref().unwrap();
+                gl.active_texture(glow::TEXTURE1);
+                gl.bind_texture(glow::TEXTURE_2D, Some(mask));
+                gl.bind_sampler(1, Some(self.sampler));
+                gl.active_texture(glow::TEXTURE0);
+                composite.draw(
+                    vertical.texture,
+                    Some(output.framebuffer),
+                    passes.composite(),
+                    primitive,
+                    vertices,
+                );
+                gl.active_texture(glow::TEXTURE1);
+                gl.bind_texture(glow::TEXTURE_2D, None);
+                gl.bind_sampler(1, None);
+                gl.active_texture(glow::TEXTURE0);
+                (&self.resolve, output.texture, std::slice::from_ref(&height))
+            };
             gl.enable(glow::BLEND);
             gl.blend_equation(glow::FUNC_ADD);
             gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
-            if target.stencil {
+            if target.stencil && passes.uses_stencil() {
                 gl.enable(glow::STENCIL_TEST);
                 gl.stencil_func(glow::NOTEQUAL, 0, 0xff);
                 gl.stencil_mask(0);
                 gl.stencil_op(glow::KEEP, glow::KEEP, glow::KEEP);
             }
-            self.composite.draw(
-                scratch.vertical.texture,
-                target.framebuffer,
-                &passes.composite,
-            );
+            program.draw(source, target.framebuffer, constants, glow::TRIANGLES, 3);
             gl.bind_texture(glow::TEXTURE_2D, None);
         }
         Ok(())
+    }
+}
+
+impl Backend for OpenGl<'_> {
+    type Mask = glow::Texture;
+    type Target<'a> = Target;
+    type Error = String;
+
+    fn draw_classic(
+        &mut self,
+        mask: &Self::Mask,
+        target: &Target,
+        passes: ClassicPasses,
+    ) -> Result<(), String> {
+        self.draw(*mask, target, DrawPasses::classic(passes))
+    }
+}
+
+impl StyledBackend for OpenGl<'_> {
+    fn draw_styled(
+        &mut self,
+        mask: &Self::Mask,
+        target: &Target,
+        passes: StyledPasses,
+    ) -> Result<(), String> {
+        self.draw(*mask, target, DrawPasses::styled(passes))
     }
 }
 
@@ -211,7 +317,7 @@ impl<'a> Program<'a> {
             }
             let Some(parameters) = gl.get_uniform_location(handle, "parameters") else {
                 gl.delete_program(handle);
-                return Err("Classic glow shader is missing its parameters uniform".into());
+                return Err("Glow shader is missing its parameters uniform".into());
             };
             Ok(Self {
                 gl,
@@ -225,7 +331,9 @@ impl<'a> Program<'a> {
         &self,
         texture: glow::Texture,
         framebuffer: Option<glow::Framebuffer>,
-        parameters: &[f32; 4],
+        parameters: &[[f32; 4]],
+        primitive: u32,
+        vertices: i32,
     ) {
         // The caller binds the fullscreen VAO and sampler and ensures that
         // the sampled texture and destination attachment are separate.
@@ -235,8 +343,8 @@ impl<'a> Program<'a> {
             self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
             self.gl.use_program(Some(self.handle));
             self.gl
-                .uniform_4_f32_slice(Some(&self.parameters), parameters);
-            self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
+                .uniform_4_f32_slice(Some(&self.parameters), parameters.as_flattened());
+            self.gl.draw_arrays(primitive, 0, vertices);
         }
     }
 }
@@ -273,7 +381,7 @@ impl<'a> RenderTexture<'a> {
             let status = gl.check_framebuffer_status(glow::DRAW_FRAMEBUFFER);
             if status != glow::FRAMEBUFFER_COMPLETE {
                 return Err(format!(
-                    "Classic glow scratch framebuffer is incomplete (0x{status:x})"
+                    "Glow scratch framebuffer is incomplete (0x{status:x})"
                 ));
             }
             Ok(target)

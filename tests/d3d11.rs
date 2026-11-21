@@ -1,7 +1,8 @@
 #![cfg(all(windows, feature = "d3d11"))]
 
+use std::time::Duration;
 use tinyglow::d3d11::{D3d11, Target};
-use tinyglow::{ClassicGlow, Extent};
+use tinyglow::{ClassicGlow, Extent, GlowStyle, StyledGlow};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP;
 use windows::Win32::Graphics::Direct3D11::*;
@@ -9,7 +10,7 @@ use windows::Win32::Graphics::Dxgi::{Common::*, IDXGIAdapter};
 use windows::core::Result;
 
 #[test]
-fn classic_fullscreen_shaders_link_and_draw_on_warp() -> Result<()> {
+fn classic_and_styled_shaders_link_and_draw_on_warp() -> Result<()> {
     const SIDE: u32 = 32;
     let extent = Extent::new(SIDE, SIDE).unwrap();
     // The resources and initial data stay alive through their API calls.
@@ -64,6 +65,7 @@ fn classic_fullscreen_shaders_link_and_draw_on_warp() -> Result<()> {
         )?;
         let mut view = None;
         device.CreateShaderResourceView(&mask.unwrap(), None, Some(&mut view))?;
+        let view = view.unwrap();
 
         let scene_format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
         let mut scene = None;
@@ -84,11 +86,12 @@ fn classic_fullscreen_shaders_link_and_draw_on_warp() -> Result<()> {
 
         let glow = ClassicGlow {
             color: [255, 0, 0],
+            thickness: 1.0,
             ..Default::default()
         };
         glow.render(
             &mut backend,
-            &view.unwrap(),
+            &view,
             &Target {
                 color: &color,
                 stencil: None,
@@ -108,18 +111,71 @@ fn classic_fullscreen_shaders_link_and_draw_on_warp() -> Result<()> {
             Some(&mut readback),
         )?;
         let readback = readback.unwrap();
-        context.CopyResource(&readback, &scene);
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        context.Map(&readback, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
-        let halo = mapped
-            .pData
-            .cast::<u8>()
-            .add(16 * mapped.RowPitch as usize + 10 * 4);
-        let rgba = halo.cast::<[u8; 4]>().read();
-        context.Unmap(&readback, 0);
+        let pixel = |scene: &ID3D11Texture2D, x: usize, y: usize| -> Result<[u8; 4]> {
+            context.CopyResource(&readback, scene);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            context.Map(&readback, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            let offset = y * mapped.RowPitch as usize + x * 4;
+            let rgba = mapped
+                .pData
+                .cast::<u8>()
+                .add(offset)
+                .cast::<[u8; 4]>()
+                .read();
+            context.Unmap(&readback, 0);
+            Ok(rgba)
+        };
 
+        let rgba = pixel(&scene, 10, 16)?;
         assert!(rgba[0] > 0, "the glow should reach past the silhouette");
         assert_eq!(&rgba[1..], &[0, 0, 127]);
+
+        let mut scene = None;
+        device.CreateTexture2D(
+            &D3D11_TEXTURE2D_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                ..base
+            },
+            None,
+            Some(&mut scene),
+        )?;
+        let scene = scene.unwrap();
+        let mut color = None;
+        device.CreateRenderTargetView(&scene, None, Some(&mut color))?;
+        let color = color.unwrap();
+        let target = Target {
+            color: &color,
+            stencil: None,
+        };
+        for &style in GlowStyle::ALL {
+            context.ClearRenderTargetView(&color, &[0.0, 0.0, 0.0, 127.0 / 255.0]);
+            let effect = StyledGlow {
+                glow,
+                ..StyledGlow::new(style)
+            };
+            effect
+                .render(
+                    &mut backend,
+                    &view,
+                    &target,
+                    extent,
+                    Duration::from_millis(1250),
+                )
+                .unwrap_or_else(|error| panic!("{}: {error}", style.name()));
+            if style == GlowStyle::Neon {
+                assert!(
+                    pixel(&scene, 10, 16)?[0] > rgba[0],
+                    "styled Neon uses raw blur coverage"
+                );
+            }
+            if style == GlowStyle::XRay {
+                assert!(
+                    pixel(&scene, 16, 16)?[0] > 0,
+                    "X-Ray samples the original silhouette"
+                );
+            }
+        }
     }
     Ok(())
 }

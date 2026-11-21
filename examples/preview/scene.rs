@@ -1,7 +1,8 @@
 use std::f32::consts::TAU;
 use std::ptr::null;
+use std::time::Duration;
 use tinyglow::d3d9::{D3d9, Target};
-use tinyglow::{ClassicGlow, Extent};
+use tinyglow::{ClassicGlow, Extent, GlowStyle, StyledGlow};
 use windows::Win32::Foundation::{E_FAIL, HWND};
 use windows::Win32::Graphics::Direct3D9::*;
 use windows::core::{Error, Result};
@@ -9,6 +10,13 @@ use windows::core::{Error, Result};
 pub const WIDTH: u32 = 944;
 pub const HEIGHT: u32 = 468;
 const PANEL: f32 = WIDTH as f32 / 2.0;
+
+#[derive(Clone, Copy)]
+pub struct Effect {
+    pub glow: ClassicGlow,
+    pub style: Option<GlowStyle>,
+    pub elapsed: Duration,
+}
 
 pub struct Scene {
     device: IDirect3DDevice9,
@@ -63,10 +71,10 @@ impl Scene {
         }
     }
 
-    pub fn render(&mut self, angle: f32, glow: Option<ClassicGlow>) -> Result<()> {
+    pub fn render(&mut self, angle: f32, glow: Option<Effect>) -> Result<()> {
         let output = Extent::new(WIDTH, HEIGHT).unwrap();
         if let Some(glow) = glow {
-            let extent = glow.mask_extent(output);
+            let extent = glow.glow.mask_extent(output);
             if self.mask.as_ref().is_none_or(|mask| mask.0 != extent) {
                 let texture = self.backend.create_mask(extent)?;
                 // This is a single-level render-target texture created above.
@@ -84,7 +92,7 @@ impl Scene {
         unsafe { self.device.Present(null(), null(), HWND::default(), null()) }
     }
 
-    fn draw(&mut self, angle: f32, glow: Option<ClassicGlow>, output: Extent) -> Result<()> {
+    fn draw(&mut self, angle: f32, glow: Option<Effect>, output: Extent) -> Result<()> {
         let device = &self.device;
         // The device, current render target and all draw data belong to this thread.
         unsafe {
@@ -140,15 +148,18 @@ impl Scene {
                 device.SetRenderTarget(0, &self.scene)?;
                 device.SetDepthStencilSurface(&self.depth)?;
                 mask_draw?;
-                glow.render(
-                    &mut self.backend,
-                    texture,
-                    &Target {
-                        color: &self.scene,
-                        stencil: Some(&self.depth),
-                    },
-                    output,
-                )?;
+                let target = Target {
+                    color: &self.scene,
+                    stencil: Some(&self.depth),
+                };
+                if let Some(style) = glow.style {
+                    let mut styled = StyledGlow::new(style);
+                    styled.glow = glow.glow;
+                    styled.render(&mut self.backend, texture, &target, output, glow.elapsed)?;
+                } else {
+                    glow.glow
+                        .render(&mut self.backend, texture, &target, output)?;
+                }
             }
         }
         Ok(())

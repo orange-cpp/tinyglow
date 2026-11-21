@@ -1,8 +1,8 @@
-use crate::scene::{HEIGHT, Scene, WIDTH};
+use crate::scene::{Effect, HEIGHT, Scene, WIDTH};
 use std::cell::Cell;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use tinyglow::{ClassicGlow, Quality};
+use tinyglow::{ClassicGlow, GlowStyle, Quality};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{COLOR_BTNFACE, DEFAULT_GUI_FONT, GetStockObject, HBRUSH};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -57,6 +57,7 @@ struct Settings {
     enabled: bool,
     color: usize,
     paused: bool,
+    style: usize,
 }
 
 impl Default for Settings {
@@ -69,6 +70,7 @@ impl Default for Settings {
             enabled: true,
             color: 0,
             paused: false,
+            style: 0,
         }
     }
 }
@@ -102,6 +104,7 @@ struct Window {
     viewport: HWND,
     buttons: Vec<HWND>,
     status: HWND,
+    styles: HWND,
 }
 
 impl Window {
@@ -157,7 +160,7 @@ impl Window {
             )?;
             window.create(
                 w!("STATIC"),
-                "Classic glow",
+                "Glow preview",
                 WS_VISIBLE,
                 0,
                 [MARGIN + WIDTH as i32 / 2, 15, WIDTH as i32 / 2, 20],
@@ -186,18 +189,59 @@ impl Window {
                 "",
                 WS_VISIBLE,
                 0,
-                [MARGIN, TOOLBAR_TOP + 42, WIDTH as i32, 22],
+                [MARGIN + 242, TOOLBAR_TOP + 44, WIDTH as i32 - 242, 22],
             )?;
+            window.create(
+                w!("STATIC"),
+                "Style",
+                WS_VISIBLE,
+                0,
+                [MARGIN, TOOLBAR_TOP + 44, 35, 22],
+            )?;
+            let styles = window.create(
+                w!("COMBOBOX"),
+                "",
+                WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
+                20,
+                [MARGIN + 38, TOOLBAR_TOP + 40, 190, 290],
+            )?;
+            for name in
+                std::iter::once("Classic").chain(GlowStyle::ALL.iter().map(|style| style.name()))
+            {
+                let name = wide(name);
+                if SendMessageW(
+                    styles,
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(name.as_ptr() as isize)),
+                )
+                .0 < 0
+                {
+                    return Err(Error::new(
+                        windows::Win32::Foundation::E_FAIL,
+                        "Could not add a glow style",
+                    ));
+                }
+            }
             Ok(Self {
                 main,
                 viewport,
                 buttons,
                 status,
+                styles,
             })
         }
     }
 
     fn update(&self, settings: &Settings) -> Result<()> {
+        unsafe {
+            SendMessageW(
+                self.styles,
+                CB_SETCURSEL,
+                Some(WPARAM(settings.style)),
+                None,
+            )
+        };
         let quality = match settings.glow.quality {
             Quality::Full => "Full resolution",
             Quality::Half => "Half resolution",
@@ -303,6 +347,7 @@ pub fn run() -> Result<()> {
     window.update(&settings)?;
     let mut scene = Some(Scene::new(window.main, window.viewport)?);
     let mut angle = 0.0;
+    let mut animation = Duration::ZERO;
     let mut last_frame = Instant::now();
     unsafe {
         let _ = ShowWindow(window.main, SW_SHOW);
@@ -325,6 +370,10 @@ pub fn run() -> Result<()> {
                 window.update(&settings)?;
             }
         }
+        let style = unsafe { SendMessageW(window.styles, CB_GETCURSEL, None, None) }.0;
+        if style >= 0 {
+            settings.style = style as usize;
+        }
         let elapsed = last_frame.elapsed();
         last_frame = Instant::now();
         if unsafe { IsIconic(window.main) }.as_bool() {
@@ -332,10 +381,20 @@ pub fn run() -> Result<()> {
             continue;
         }
         if !settings.paused {
+            animation += elapsed;
             angle = (angle + elapsed.as_secs_f32().min(0.05) * 0.9) % std::f32::consts::TAU;
         }
+        let effect = settings.enabled.then(|| Effect {
+            glow: settings.glow,
+            style: settings
+                .style
+                .checked_sub(1)
+                .and_then(|index| GlowStyle::ALL.get(index))
+                .copied(),
+            elapsed: animation,
+        });
         let draw = match &mut scene {
-            Some(scene) => scene.render(angle, settings.enabled.then_some(settings.glow)),
+            Some(scene) => scene.render(angle, effect),
             None => Scene::new(window.main, window.viewport).map(|renderer| scene = Some(renderer)),
         };
         if let Err(error) = draw {
